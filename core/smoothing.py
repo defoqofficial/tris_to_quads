@@ -14,12 +14,13 @@ TRANSITION_RATIO = 2.5
 
 
 def _laplacian_target(vert: bmesh.types.BMVert) -> Vector:
-    if not vert.link_verts:
+    if not vert.link_edges:
         return vert.co.copy()
     acc = Vector((0.0, 0.0, 0.0))
-    for nv in vert.link_verts:
-        acc += nv.co
-    return acc / len(vert.link_verts)
+    for edge in vert.link_edges:
+        other = edge.other_vert(vert)
+        acc += other.co
+    return acc / len(vert.link_edges)
 
 
 def _project_tangent(delta: Vector, normal: Vector) -> Vector:
@@ -93,8 +94,8 @@ def smooth_local_around_quad(
     """Smooth quad corners and their edge neighbors."""
     to_smooth: Set[bmesh.types.BMVert] = set(quad_verts)
     for v in quad_verts:
-        for nv in v.link_verts:
-            to_smooth.add(nv)
+        for edge in v.link_edges:
+            to_smooth.add(edge.other_vert(v))
     for v in to_smooth:
         smooth_vert_local(graph, v, front_verts, bvh, preserve_boundary)
 
