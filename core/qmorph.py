@@ -57,6 +57,7 @@ class QMorphEngine:
         self.front = FrontManager(graph, self.settings.angle_threshold)
         self.progress = QMorphProgress()
         self._cancelled = False
+        self._initialized = False
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -64,6 +65,7 @@ class QMorphEngine:
     def run(self, max_steps: Optional[int] = None) -> QMorphResult:
         self.graph.refresh()
         self.front.initialize()
+        self._initialized = True
         steps = 0
         max_steps = max_steps or len(self.graph.tri_faces) * 4
 
@@ -101,8 +103,10 @@ class QMorphEngine:
         batch_size = batch_size or self.settings.batch_size
         if self.progress.done:
             return False
-        if self.progress.steps == 0 and self.front.remaining_estimate() == 0:
+        if not self._initialized:
+            self.graph.refresh()
             self.front.initialize()
+            self._initialized = True
 
         for _ in range(batch_size):
             if self._cancelled:
