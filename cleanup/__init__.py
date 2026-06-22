@@ -1,0 +1,1 @@
+# STAR-inspired topological cleanup

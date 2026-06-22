@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "q_morph_quads"
+version = "1.0.0"
+name = "Q-Morph Quad Meshing"
+tagline = "Convert triangle meshes to optimized quad meshes using Q-Morph"
+maintainer = "Q-Morph Addon"
+type = "add-on"
+blender_version_min = "5.1.0"
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+tags = ["Mesh"]
