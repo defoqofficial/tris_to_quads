@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from enum import IntEnum
 from typing import Iterable, List, Optional, Set, Tuple
@@ -9,6 +10,8 @@ from typing import Iterable, List, Optional, Set, Tuple
 import bmesh
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
+
+logger = logging.getLogger(__name__)
 
 
 class FaceKind(IntEnum):
@@ -37,7 +40,14 @@ class MeshGraph:
         self._rebuild_face_sets()
 
     def face_kind(self, face: bmesh.types.BMFace) -> FaceKind:
-        return FaceKind.QUAD if face in self.quad_faces else FaceKind.TRI
+        """Classify face kind with stricter checking to avoid ngons."""
+        if face in self.quad_faces:
+            return FaceKind.QUAD
+        if face in self.tri_faces:
+            return FaceKind.TRI
+        # Log unexpected face type for diagnostics
+        logger.debug(f"Unexpected face with {len(face.verts)} vertices")
+        return FaceKind.TRI  # Default fallback, but logged
 
     def is_boundary_edge(self, edge: bmesh.types.BMEdge) -> bool:
         return edge.is_boundary or len(edge.link_faces) == 1
@@ -199,10 +209,16 @@ class MeshGraph:
     ) -> Set[bmesh.types.BMFace]:
         """Collect triangle faces inside the quad bounded by corners."""
         corner_set = set(corners)
+        
+        # Explicitly pick seed faces from the tri-side only
         seed_faces: Set[bmesh.types.BMFace] = set()
-        for e in front_edge.link_faces:
-            if e in self.tri_faces:
-                seed_faces.add(e)
+        for face in front_edge.link_faces:
+            if face in self.tri_faces:
+                seed_faces.add(face)
+        
+        if not seed_faces:
+            logger.debug("collect_tris_in_quad_region: no tri-side seed faces found")
+            return set()
 
         collected: Set[bmesh.types.BMFace] = set()
         stack = list(seed_faces)
@@ -218,22 +234,112 @@ class MeshGraph:
                             stack.append(nf)
         return collected
 
+    def _order_quad_verts(
+        self, verts: List[bmesh.types.BMVert], shared_edge: bmesh.types.BMEdge
+    ) -> Optional[Tuple[bmesh.types.BMVert, ...]]:
+        """Order 4 verts consistently around quad center in planar winding order."""
+        v0, v1 = shared_edge.verts
+        tips = [v for v in verts if v not in shared_edge.verts]
+        if len(tips) != 2:
+            logger.debug(f"_order_quad_verts: expected 2 tips, got {len(tips)}")
+            return None
+        
+        # Compute quad center and tangent plane
+        center = (v0.co + v1.co + tips[0].co + tips[1].co) * 0.25
+        normal = self.tangent_normal_at_co(center)
+        
+        # Project all 4 verts to tangent plane and sort by angle around center
+        def project_to_plane(pt: Vector) -> Vector:
+            v = pt - center
+            n = normal.normalized()
+            return v - n * v.dot(n)
+        
+        # Create a local 2D coordinate system on the plane
+        proj_v0 = project_to_plane(v0.co)
+        proj_v1 = project_to_plane(v1.co)
+        proj_t0 = project_to_plane(tips[0].co)
+        proj_t1 = project_to_plane(tips[1].co)
+        
+        # Use first edge direction as reference for angle calculation
+        ref_dir = proj_v0.normalized() if proj_v0.length_squared > 1e-12 else Vector((1.0, 0.0, 0.0))
+        
+        # Calculate angles around center for all vertices
+        def angle_from_center(proj: Vector) -> float:
+            if proj.length_squared < 1e-12:
+                return 0.0
+            # Project to a 2D angle using atan2 with a perpendicular vector
+            perp = normal.cross(ref_dir).normalized()
+            x = proj.dot(ref_dir)
+            y = proj.dot(perp)
+            return math.atan2(y, x)
+        
+        angles = [
+            (angle_from_center(proj_v0), v0),
+            (angle_from_center(proj_v1), v1),
+            (angle_from_center(proj_t0), tips[0]),
+            (angle_from_center(proj_t1), tips[1]),
+        ]
+        
+        # Sort by angle to get consistent winding order
+        angles.sort(key=lambda x: x[0])
+        ordered = tuple(v for _, v in angles)
+        
+        logger.debug(f"_order_quad_verts: ordered {[id(v) for v in ordered]}")
+        return ordered
+
     def form_quad(
         self,
         verts: Tuple[bmesh.types.BMVert, bmesh.types.BMVert, bmesh.types.BMVert, bmesh.types.BMVert],
         tris_to_remove: Iterable[bmesh.types.BMFace],
     ) -> Optional[bmesh.types.BMFace]:
-        """Delete interior tris and create a quad face."""
+        """Delete interior tris and create a quad face with robust error handling."""
         tris = [f for f in tris_to_remove if f.is_valid]
+        
+        # Delete interior triangles
         if tris:
-            bmesh.ops.delete(self.bm, geom=tris, context="FACES")
+            try:
+                bmesh.ops.delete(self.bm, geom=tris, context="FACES")
+            except Exception as e:
+                logger.warning(f"form_quad: failed to delete interior tris: {e}")
+                return None
+        
         self.refresh()
+        
+        # Attempt to create the quad face
         try:
+            # Try direct face creation first
             face = self.bm.faces.new(list(verts))
             self.quad_faces.add(face)
             self.refresh()
+            logger.debug(f"form_quad: successfully created quad with verts {[id(v) for v in verts]}")
             return face
-        except Exception:
+        except ValueError as e:
+            logger.warning(f"form_quad: direct face creation failed with {e}, retrying with edge healing")
+            # If direct creation fails, try ensuring edges exist and recreate
+            try:
+                self.refresh()
+                # Ensure all edges between consecutive vertices exist
+                for i in range(4):
+                    v_curr = verts[i]
+                    v_next = verts[(i + 1) % 4]
+                    if not self.edge_exists(v_curr, v_next):
+                        try:
+                            self.bm.edges.new((v_curr, v_next))
+                        except Exception as edge_e:
+                            logger.debug(f"form_quad: could not create edge {i}-{(i+1)%4}: {edge_e}")
+                            return None
+                self.refresh()
+                # Try again with edges in place
+                face = self.bm.faces.new(list(verts))
+                self.quad_faces.add(face)
+                self.refresh()
+                logger.debug(f"form_quad: quad created after edge healing")
+                return face
+            except Exception as retry_e:
+                logger.error(f"form_quad: quad creation failed after retry: {retry_e} with verts {[str(v.index) for v in verts]}")
+                return None
+        except Exception as e:
+            logger.error(f"form_quad: unexpected error creating quad: {e}")
             return None
 
     def merge_pair_to_quad(
@@ -251,20 +357,12 @@ class MeshGraph:
                 if v not in vset:
                     vset.append(v)
         if len(vset) != 4:
+            logger.debug(f"merge_pair_to_quad: expected 4 unique verts, got {len(vset)}")
             return None
         ordered = self._order_quad_verts(vset, edge)
         if ordered is None:
             return None
         return self.form_quad(ordered, (f0, f1))
-
-    def _order_quad_verts(
-        self, verts: List[bmesh.types.BMVert], shared_edge: bmesh.types.BMEdge
-    ) -> Optional[Tuple[bmesh.types.BMVert, ...]]:
-        v0, v1 = shared_edge.verts
-        tips = [v for v in verts if v not in shared_edge.verts]
-        if len(tips) != 2:
-            return None
-        return (v0, tips[0], v1, tips[1])
 
     def valence(self, vert: bmesh.types.BMVert) -> int:
         return len(vert.link_edges)
