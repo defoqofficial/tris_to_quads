@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import bmesh
 import bpy
 from bpy.types import Operator
@@ -12,30 +14,56 @@ from ..core.mesh_graph import MeshGraph
 from ..core.qmorph import QMorphEngine, QMorphSettings
 from ..core.smoothing import smooth_global
 
+logger = logging.getLogger(__name__)
+
 
 def _prepare_bmesh(obj, selected_only: bool) -> tuple[bmesh.types.BMesh, str | None]:
+    """Prepare bmesh for conversion with robust selection handling."""
     me = obj.data
     bm = bmesh.from_edit_mesh(me)
 
+    # Determine working set of faces
     if selected_only:
         faces = [f for f in bm.faces if f.select]
         if not faces:
+            logger.info("No faces selected; converting entire mesh")
             selected_only = False
 
     if not selected_only:
         faces = list(bm.faces)
+        # Mark all faces as selected for triangulation
         for f in bm.faces:
             f.select = True
 
     # Triangulate all non-triangle faces in working set (ngons and quads).
     non_tris = [f for f in faces if len(f.verts) != 3]
     if non_tris:
-        bmesh.ops.triangulate(bm, faces=non_tris)
+        logger.info(f"Triangulating {len(non_tris)} non-triangle faces")
+        try:
+            bmesh.ops.triangulate(bm, faces=non_tris)
+        except Exception as e:
+            logger.error(f"Triangulation failed: {e}")
+            return bm, f"Triangulation failed: {e}"
 
-    tris = [f for f in bm.faces if f.select and len(f.verts) == 3]
+    # Ensure lookup table is up-to-date after triangulation
+    bm.faces.ensure_lookup_table()
+    
+    # Re-evaluate working set after triangulation
+    # If we're converting the whole mesh, get all current triangles
+    # Otherwise, get triangles from the originally-selected faces (they may have been subdivided)
+    if not selected_only:
+        tris = [f for f in bm.faces if len(f.verts) == 3]
+    else:
+        # For selected-only mode, only count tris from originally selected faces or their children
+        # This is a conservative approach: count all triangles that exist and are marked selected
+        tris = [f for f in bm.faces if f.select and len(f.verts) == 3]
+    
     if not tris:
-        return bm, "No triangles to convert."
+        msg = "No triangles to convert."
+        logger.warning(msg)
+        return bm, msg
 
+    logger.info(f"Prepared mesh with {len(tris)} triangles for conversion")
     return bm, None
 
 
@@ -66,6 +94,7 @@ class MESH_OT_qmorph_convert_to_quads(Operator):
         self._bm, err = _prepare_bmesh(self._obj, selected_only=True)
         if err:
             self.report({"WARNING"}, err)
+            logger.warning(f"Preparation failed: {err}")
             return {"CANCELLED"}
 
         self._graph = MeshGraph(self._bm)
@@ -83,6 +112,7 @@ class MESH_OT_qmorph_convert_to_quads(Operator):
         self._timer = wm.event_timer_add(0.05, window=context.window)
         wm.modal_handler_add(self)
         context.workspace.status_text_set("Q-Morph running… [ESC] cancel")
+        logger.info("Q-Morph conversion started")
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
@@ -113,17 +143,20 @@ class MESH_OT_qmorph_convert_to_quads(Operator):
 
         if cancelled:
             self.report({"INFO"}, "Q-Morph cancelled.")
+            logger.info("Q-Morph cancelled by user")
             return
 
         props = context.scene.qmorph_props
 
         # STAR cleanup
         if props.cleanup_passes > 0:
+            logger.info(f"Running {props.cleanup_passes} cleanup passes")
             cleanup_valence(self._graph, props.cleanup_passes)
             remove_all_doublets(self._graph)
 
         # Final smoothing
         if props.smooth_iterations > 0:
+            logger.info(f"Running {props.smooth_iterations} smoothing iterations")
             smooth_global(
                 self._graph,
                 props.smooth_iterations,
@@ -137,6 +170,7 @@ class MESH_OT_qmorph_convert_to_quads(Operator):
         if tris_left:
             msg += f", {tris_left} triangle(s) remaining"
         self.report({"INFO"}, msg)
+        logger.info(msg)
 
 
 def menu_func(self, context):
