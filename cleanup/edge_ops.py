@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import bmesh
 
 from ..core.mesh_graph import MeshGraph
+
+logger = logging.getLogger(__name__)
 
 
 def edge_rotate(graph: MeshGraph, edge: bmesh.types.BMEdge) -> bool:
@@ -18,8 +21,10 @@ def edge_rotate(graph: MeshGraph, edge: bmesh.types.BMEdge) -> bool:
     try:
         bmesh.ops.rotate_edges(graph.bm, edges=[edge], ccw=False)
         graph.refresh()
+        logger.debug(f"Edge rotate successful for edge {edge.index}")
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Edge rotate failed: {e}")
         return False
 
 
@@ -32,8 +37,10 @@ def remove_doublet(graph: MeshGraph, vert: bmesh.types.BMVert) -> bool:
     try:
         bmesh.ops.dissolve_verts(graph.bm, verts=[vert], use_face_split=False)
         graph.refresh()
+        logger.debug(f"Doublet removed: vertex {vert.index}")
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Doublet removal failed: {e}")
         return False
 
 
@@ -58,10 +65,14 @@ def try_improve_edge_flow(graph: MeshGraph) -> int:
                 improved += 1
             elif after > before:
                 edge_rotate(graph, edge)  # revert
+    
+    if improved > 0:
+        logger.debug(f"Edge flow: {improved} edges improved")
     return improved
 
 
 def remove_all_doublets(graph: MeshGraph) -> int:
+    """Remove all valence-2 interior vertices."""
     removed = 0
     changed = True
     while changed:
@@ -71,4 +82,7 @@ def remove_all_doublets(graph: MeshGraph) -> int:
             if remove_doublet(graph, v):
                 removed += 1
                 changed = True
+    
+    if removed > 0:
+        logger.info(f"Removed {removed} doublets")
     return removed
